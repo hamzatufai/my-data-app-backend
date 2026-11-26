@@ -1,0 +1,18 @@
+# Dependencies
+/node_modules
+/.pnp
+.pnp.*
+
+# Next.js build output
+/.next/
+/out/
+/build/
+
+# Local secrets and environment overrides
+.env*
+!.env.example
+
+# Local tooling output
+/.vercel
+*.tsbuildinfo
+npm-debug.log*
