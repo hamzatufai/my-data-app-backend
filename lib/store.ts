@@ -10,6 +10,7 @@
  *   silently falls back or fakes persistence.
  */
 import { promises as fs } from "fs";
+import os from "os";
 import path from "path";
 
 export type UserStatus =
@@ -108,7 +109,21 @@ export type Db = {
   brandVersions: (PlatformSettings & { id: string; changedAt: string })[];
 };
 
-const DATA_DIR = process.env.CLEANCSV_DATA_DIR ?? path.join(process.cwd(), "data");
+/**
+ * Writable storage location.
+ * - Vercel serverless functions have a READ-ONLY project filesystem; only /tmp
+ *   is writable. Writing to process.cwd()/data there causes HTTP 500s on every
+ *   request that touches the store.
+ * - Local runs keep the convenient project ./data directory, or honour an
+ *   explicit CLEANCSV_DATA_DIR override.
+ * NOTE: /tmp is per-instance and cleared between cold starts. For a durable
+ * multi-instance production deployment, set CLEANCSV_DATA_DIR to a mounted
+ * store or move to the Postgres adapter (PRD §25), not a silent fallback.
+ */
+const onVercel = process.env.VERCEL === "1" || Boolean(process.env.NOW_REGION);
+const DATA_DIR =
+  process.env.CLEANCSV_DATA_DIR ??
+  (onVercel ? path.join(os.tmpdir(), "cleancsv-data") : path.join(process.cwd(), "data"));
 const DB_PATH = path.join(DATA_DIR, "db.json");
 
 let current: Db | null = null;
