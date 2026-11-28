@@ -79,10 +79,14 @@ export function rateLimit(key: string, max: number, windowMs: number): { ok: boo
 export const SIGN_IN_LOCK = { maxFailures: 5, lockMs: 15 * 60_000 };
 
 export const SESSION_TTL = {
-  userIdle: 1000 * 60 * 60 * 12,
-  adminIdle: 1000 * 60 * 30, // ADM-02 30-minute idle timeout
-  absolute: 1000 * 60 * 60 * 8, // 8-hour absolute limit
+  // Approved analysts stay signed in for 30 days: the session record is
+  // durable (DATABASE_URL-backed), so the token only needs revoking — the
+  // user never re-authenticates mid-work because of a server restart.
+  userIdle: 1000 * 60 * 60 * 24 * 30,
+  adminIdle: 1000 * 60 * 30, // ADM-02: strict 30-minute admin idle timeout
+  absolute: 1000 * 60 * 60 * 24 * 30,
 };
+export const SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days, seconds
 
 export function sessionValid(session: { createdAt: string; lastSeenAt: string; revokedAt: string | null; role: string }, nowMs = Date.now()): boolean {
   if (session.revokedAt) return false;
@@ -94,7 +98,7 @@ export function sessionValid(session: { createdAt: string; lastSeenAt: string; r
 
 export function sessionCookie(sessionId: string, kind: "user" | "admin"): string {
   const name = kind === "admin" ? "cleancsv_admin_session" : "cleancsv_session";
-  return `${name}=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${8 * 60 * 60}`;
+  return `${name}=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_COOKIE_MAX_AGE}`;
 }
 
 export function clearCookie(kind: "user" | "admin"): string {

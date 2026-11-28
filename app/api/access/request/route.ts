@@ -82,18 +82,22 @@ export async function POST(request: Request) {
     };
 
     await withDb((store) => {
+      // Re-find the user inside the durable transaction so the mutation
+      // applies to the stored copy (not the pre-transaction read).
+      const durable = store.users.find((u) => u.id === user.id);
+      if (!durable) return;
       store.accessRequests.push(record);
-      user.requestSubmittedAt = record.createdAt;
-      user.status = "pending";
-      user.requestText = intendedUse;
-      user.statusHistory.push({ status: "pending", at: record.createdAt, by: "access-request" });
+      durable.requestSubmittedAt = record.createdAt;
+      durable.status = "pending";
+      durable.requestText = intendedUse;
+      durable.statusHistory.push({ status: "pending", at: record.createdAt, by: "access-request" });
       store.adminAuditEvents.push({
         id: newId(),
         adminId: null,
         action: "access.request_submitted",
         targetType: "request",
         targetId: record.id,
-        details: `Access request submitted by ${user.email.slice(0, 2)}***`,
+        details: `Access request submitted by ${durable.email.slice(0, 2)}***`,
         timestamp: record.createdAt,
       });
     });

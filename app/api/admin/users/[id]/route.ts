@@ -8,7 +8,7 @@ import {
   Forbidden, ValidationError, fail, handleError, json, readJsonBody,
 } from "@/lib/api-helpers";
 import { requireAdmin } from "@/lib/api-helpers";
-import { loadDb, withDb, type ScheduledStatusAction, type UserStatus } from "@/lib/store";
+import { loadDb, withDb, type UserStatus } from "@/lib/store";
 import { newId } from "@/lib/auth";
 import { accessDecisionEmail, sendEmail } from "@/lib/email";
 
@@ -53,7 +53,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const { user: admin } = await requireAdmin(request, db);
     const { id } = await params;
     const body = await readJsonBody(request);
-    const action = String(body.action ?? "") as ScheduledStatusAction;
+    const action = String(body.action ?? "") as "approve" | "reject" | "suspend" | "reactivate" | "delete";
     const reason = String(body.reason ?? "").trim();
 
     if (!["approve", "reject", "suspend", "reactivate", "delete"].includes(action)) {

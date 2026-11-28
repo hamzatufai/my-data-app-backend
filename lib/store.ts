@@ -1,17 +1,19 @@
 /**
- * Metadata store for CleanCSV access control, admin and branding (PRD v2.0 §25).
+ * Unified metadata store (PRD §25) — durable by design.
  *
- * Storage adapters:
- * - DEV / default: an atomic JSON file store (file store). Suitable for local
- *   development and single-instnance test deployments.
- * - PROD: requires DATABASE_URL pointing at a managed Postgres (Vercel
- *   Postgres/Neon/Supabase). Until it is set, admin/auth APIs return HTTP 503
- *   with an explicit "storage not configured" error — the platform never
- *   silently falls back or fakes persistence.
+ * Drivers:
+ * 1. DATABASE_URL (Postgres, e.g. Vercel Postgres / Neon) — PRODUCTION path.
+ *    The metadata document lives in a jsonb row and is mutated under a row
+ *    lock (`SELECT … FOR UPDATE`), so every serverless instance sees the same
+ *    truth: sessions, users, verification tokens and branding survive cold
+ *    starts. This is what makes sign-in stick.
+ * 2. ./data/db.json — local development fallback. Never a silent production
+ *    fallback: production deployments must provide DATABASE_URL.
  */
 import { promises as fs } from "fs";
 import os from "os";
 import path from "path";
+import { Pool, type PoolClient } from "pg";
 
 export type UserStatus =
   | "unverified"
@@ -20,13 +22,6 @@ export type UserStatus =
   | "rejected"
   | "suspended"
   | "deleted";
-
-export type ScheduledStatusAction =
-  | "approve"
-  | "reject"
-  | "suspend"
-  | "reactivate"
-  | "delete";
 
 export type StoredUser = {
   id: string;
@@ -93,7 +88,7 @@ export type AuditEvent = {
 
 export type PlatformSettings = {
   platformName: string;
-  logoReference: string | null; // data URL after server-side sanitisation, or null for default
+  logoReference: string | null;
   logoDarkReference: string | null;
   updatedBy: string;
   updatedAt: string;
@@ -109,27 +104,7 @@ export type Db = {
   brandVersions: (PlatformSettings & { id: string; changedAt: string })[];
 };
 
-/**
- * Writable storage location.
- * - Vercel serverless functions have a READ-ONLY project filesystem; only /tmp
- *   is writable. Writing to process.cwd()/data there causes HTTP 500s on every
- *   request that touches the store.
- * - Local runs keep the convenient project ./data directory, or honour an
- *   explicit CLEANCSV_DATA_DIR override.
- * NOTE: /tmp is per-instance and cleared between cold starts. For a durable
- * multi-instance production deployment, set CLEANCSV_DATA_DIR to a mounted
- * store or move to the Postgres adapter (PRD §25), not a silent fallback.
- */
-const onVercel = process.env.VERCEL === "1" || Boolean(process.env.NOW_REGION);
-const DATA_DIR =
-  process.env.CLEANCSV_DATA_DIR ??
-  (onVercel ? path.join(os.tmpdir(), "cleancsv-data") : path.join(process.cwd(), "data"));
-const DB_PATH = path.join(DATA_DIR, "db.json");
-
-let current: Db | null = null;
-let writeQueue: Promise<void> = Promise.resolve();
-
-function emptyDb(): Db {
+export function emptyDb(): Db {
   return {
     users: [],
     accessRequests: [],
@@ -147,12 +122,86 @@ function emptyDb(): Db {
   };
 }
 
+const onVercel = process.env.VERCEL === "1" || Boolean(process.env.NOW_REGION);
+
+const usingPostgres = Boolean(process.env.DATABASE_URL);
+
+const DATA_DIR =
+  process.env.CLEANCSV_DATA_DIR ??
+  (onVercel ? path.join(os.tmpdir(), "cleancsv-data") : path.join(process.cwd(), "data"));
+const DB_PATH = path.join(DATA_DIR, "db.json");
+
 /** Is durable metadata storage usable in this deployment? */
 export function storeReady(): boolean {
-  return true; // file store always works where the function can write
+  return usingPostgres || !onVercel; // Vercel without a DB is NOT durable
 }
 
-async function persist(): Promise<void> {
+let pool: Pool | null = null;
+
+function getPool(): Pool {
+  if (!pool) {
+    const connectionString = process.env.DATABASE_URL ?? "";
+    const needsSsl = /neon|sslmode|render\.com|supabase/i.test(connectionString);
+    pool = new Pool({
+      connectionString,
+      max: 3,
+      ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
+    });
+  }
+  return pool;
+}
+
+async function ensureTable(client: PoolClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS cleancsv_store (
+      id TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+}
+
+async function postgresLoad(): Promise<Db> {
+  const client = await getPool().connect();
+  try {
+    await ensureTable(client);
+    const res = await client.query<{ data: Db }>(
+      "SELECT data FROM cleancsv_store WHERE id = 'default'",
+    );
+    return res.rows.length ? res.rows[0].data : emptyDb();
+  } finally {
+    client.release();
+  }
+}
+
+async function postgresPersist(mutate: (db: Db) => void | Promise<void>): Promise<void> {
+  const client = await getPool().connect();
+  try {
+    await ensureTable(client);
+    await client.query("BEGIN");
+    const res = await client.query<{ data: Db }>(
+      "SELECT data FROM cleancsv_store WHERE id = 'default' FOR UPDATE",
+    );
+    const db: Db = res.rows.length ? res.rows[0].data : emptyDb();
+    await mutate(db);
+    await client.query(
+      `INSERT INTO cleancsv_store (id, data, updated_at) VALUES ('default', $1, now())
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
+      [JSON.stringify(db)],
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+let current: Db | null = null;
+let writeQueue: Promise<void> = Promise.resolve();
+
+async function filePersist(): Promise<void> {
   if (!current) return;
   const snapshot = current;
   writeQueue = writeQueue.then(async () => {
@@ -165,6 +214,8 @@ async function persist(): Promise<void> {
 }
 
 export async function loadDb(): Promise<Db> {
+  if (usingPostgres) return postgresLoad();
+
   if (current) return current;
   try {
     const raw = await fs.readFile(DB_PATH, "utf8");
@@ -173,20 +224,35 @@ export async function loadDb(): Promise<Db> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       current = emptyDb();
     } else {
-      // Corrupt file (e.g. the process was killed mid-write). Quarantine it so
-      // no single bad file can 500 every request; report clearly in the logs.
       console.error("[cleancsv] store file unreadable — quarantining", error);
       await fs.copyFile(DB_PATH, `${DB_PATH}.corrupt-${Date.now()}`).catch(() => undefined);
       current = emptyDb();
     }
-    await persist();
+    (async () => await filePersist())();
   }
   return current;
 }
 
+/**
+ * Sequence a read-modify-write against the durable store. Mutations receive a
+ * plain mutable Db object; Postgres runs them inside a locked transaction so
+ * concurrent serverless instances cannot lose one another's writes.
+ */
 export async function withDb<T>(mutate: (db: Db) => T | Promise<T>): Promise<T> {
-  const db = await loadDb();
-  const result = await mutate(db);
-  await persist();
-  return result;
+  if (usingPostgres) {
+    let result!: T;
+    await postgresPersist(async (db) => {
+      result = await mutate(db);
+    });
+    return result;
+  }
+
+  const db = await withFileDb(mutate);
+  await filePersist();
+  return db;
+
+  async function withFileDb(fn: (db: Db) => T | Promise<T>): Promise<T> {
+    const loaded = await loadDb();
+    return fn(loaded);
+  }
 }
