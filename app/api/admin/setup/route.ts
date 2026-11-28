@@ -5,10 +5,10 @@
  * - Returns a signed-in admin session (MFA enrolment hook documented below).
  */
 import {
-  Conflict, Forbidden, RateLimited, ValidationError, fail, handleError, json, readClientIp, readJsonBody,
+  Forbidden, RateLimited, ValidationError, handleError, json, readClientIp, readJsonBody,
 } from "@/lib/api-helpers";
 import {
-  hashPassword, hashToken, newId, passwordIssues, rateLimit, sessionCookie,
+  hashPassword, hashToken, newId, passwordIssues, rateLimit, sessionCookie, verifyPassword,
 } from "@/lib/auth";
 import { loadDb, withDb, type StoredUser } from "@/lib/store";
 import { corsHeaders, preflight } from "@/lib/cors";
@@ -57,11 +57,56 @@ export async function POST(request: Request) {
     const issues = passwordIssues(password);
     if (issues.length) throw new ValidationError(issues[0]);
 
-    if (db.users.some((u) => u.email === email)) {
-      throw new Conflict("This email is already registered. Use sign-in instead of admin setup.");
-    }
 
     const now = new Date().toISOString();
+
+    // One-time claim: if this email already registered through the normal
+    // sign-up flow, the setup token upgrades THAT account to admin (password
+    // proof required) — no duplicate sign-up needed.
+    const existing = db.users.find((u) => u.email === email);
+    if (existing) {
+      if (!verifyPassword(password, existing.passwordHash)) {
+        // Same generic response as a wrong credential anywhere (AUTH-05).
+        return json(request, { error: "Email or password is incorrect." }, 401);
+      }
+      existing.role = "admin";
+      existing.status = "approved";
+      existing.emailVerifiedAt = existing.emailVerifiedAt ?? now;
+      existing.statusHistory.push({ status: "approved", at: now, by: "first-run-setup (claimed existing account)" });
+      const claimSession = {
+        id: newId(),
+        userId: existing.id,
+        role: "admin" as const,
+        createdAt: now,
+        lastSeenAt: now,
+        revokedAt: null,
+      };
+      await withDb((store) => {
+        store.sessions.push(claimSession);
+        store.adminAuditEvents.push({
+          id: newId(),
+          adminId: existing.id,
+          action: "admin.setup_claimed",
+          targetType: "admin",
+          targetId: existing.id,
+          details: `Existing account ${existing.email.slice(0, 2)}*** upgraded to platform administrator during first-run setup`,
+          timestamp: now,
+        });
+      });
+      const claimPayload = {
+        message: "Your existing account is now the platform administrator.",
+        role: "admin",
+        user: { id: existing.id, name: existing.name, email: existing.email, role: "admin" },
+      };
+      return Response.json(claimPayload, {
+        headers: {
+          ...corsHeaders(request),
+          "Cache-Control": "no-store",
+          "Set-Cookie": sessionCookie(claimSession.id, "admin"),
+        },
+      });
+    }
+
     const admin: StoredUser = {
       id: newId(),
       role: "admin",
