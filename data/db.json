@@ -1,0 +1,15 @@
+{
+  "users": [],
+  "accessRequests": [],
+  "tokens": [],
+  "sessions": [],
+  "adminAuditEvents": [],
+  "platformSettings": {
+    "platformName": "CleanCSV",
+    "logoReference": null,
+    "logoDarkReference": null,
+    "updatedBy": "default",
+    "updatedAt": "2026-11-28T04:10:45.366Z"
+  },
+  "brandVersions": []
+}
